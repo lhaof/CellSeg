@@ -27,13 +27,14 @@ from skimage.color import rgb2hsv
 img_to_tensor = transforms.ToTensor()
 import random
 import tifffile as tif
-path = 'allimages/images/'
+path = '/data1/partitionA/CUHKSZ/histopath_2022/grand_competition/Train_Labeled/images/'
 files = os.listdir(path)
 binary_path = '0/'
 gray_path = '1/'
 colored_path = 'colored/'
 os.makedirs(binary_path, exist_ok=True)
 os.makedirs(colored_path, exist_ok=True)
+os.makedirs(gray_path, exist_ok=True)
 for img_name in files:
     img_path = path + str(img_name)
     if img_name.endswith('.tif') or img_name.endswith('.tiff'):
@@ -46,11 +47,14 @@ for img_name in files:
         shutil.copyfile(path + img_name, colored_path + img_name)
     else:
         hsv_img = rgb2hsv(img_data)
-        hue = hsv_img[:,:,0]
-        if hue.max() > 0.5:
+        s = hsv_img[:,:,1]
+        v = hsv_img[:,:,2]
+        print(img_name,s.mean(),v.mean())
+        if s.mean() > 0.1 or (v.mean()<0.1 or v.mean() > 0.6):
             shutil.copyfile(path + img_name, colored_path + img_name)
         else:
             shutil.copyfile(path + img_name, gray_path + img_name)
+
 
 
 # In[3]:
@@ -77,7 +81,6 @@ for img_name in files:
         shutil.copyfile(path + img_name, big_path + img_name)
     else:
         shutil.copyfile(path + img_name, small_path + img_name)
-
 
 
 
