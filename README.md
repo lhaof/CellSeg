@@ -1,7 +1,9 @@
 # Solution of SRIBD-Med Team for NeurIPS2022-CellSeg Challenge
+
+BEFORE YOU RAISE AN ISSUE, PLEASE SEND YOUR QUESTIONS TO lhaof\@sribd.cn AND weilou\@link.cuhk.edu.cn
+
 Institution: Shenzhen Research Institute of Big Data (SRIBD, http://www.sribd.cn/)  
 Authors: Wei Lou\*, Xinyi Yu\*, Chenyu Liu\*, Xiang Wan, Guanbin Li, Siqi Liu, Haofeng Li\# (http://haofengli.net/)  
-Emails: lhaof\@sribd.cn, weilou\@link.cuhk.edu.cn (Please contact us if you have any questions)
 
 This repository provides the solution of team Sribd-med for [NeurIPS-CellSeg](https://neurips22-cellseg.grand-challenge.org/) Challenge. The details of our method are described in our paper [Multi-stream Cell Segmentation with Low-level Cues for Multi-modality Images]. Some parts of the codes are from the baseline codes of the [NeurIPS-CellSeg-Baseline](https://github.com/JunMa11/NeurIPS-CellSeg) repository,
 
