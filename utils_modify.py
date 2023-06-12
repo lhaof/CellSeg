@@ -14,11 +14,11 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from stardist.big import _grid_divisible, BlockND, OBJECT_KEYS#, repaint_labels
-from stardist.matching import relabel_sequential
-from stardist import dist_to_coord, non_maximum_suppression, polygons_to_label
-from stardist import random_label_cmap,ray_angles
-from stardist import star_dist,edt_prob
+from stardist_pkg.big import _grid_divisible, BlockND, OBJECT_KEYS#, repaint_labels
+from stardist_pkg.matching import relabel_sequential
+from stardist_pkg import dist_to_coord, non_maximum_suppression, polygons_to_label
+#from stardist_pkg import dist_to_coord, polygons_to_label
+from stardist_pkg import star_dist,edt_prob
 from monai.data.meta_tensor import MetaTensor
 from monai.data.utils import compute_importance_map, dense_patch_slices, get_valid_patch_size
 from monai.transforms import Resize
@@ -32,10 +32,382 @@ from monai.utils import (
     look_up_option,
     optional_import,
 )
+import cv2
+from scipy import ndimage
+from scipy.ndimage.filters import gaussian_filter
+from scipy.ndimage.interpolation import affine_transform, map_coordinates
+from skimage import morphology as morph
+from scipy.ndimage import filters, measurements
+from scipy.ndimage.morphology import (
+    binary_dilation,
+    binary_fill_holes,
+    distance_transform_cdt,
+    distance_transform_edt,
+)
 
+from skimage.segmentation import watershed
 tqdm, _ = optional_import("tqdm", name="tqdm")
 
 __all__ = ["sliding_window_inference"]
+
+
+####
+def normalize(mask, dtype=np.uint8):
+    return (255 * mask / np.amax(mask)).astype(dtype)
+
+def fix_mirror_padding(ann):
+    """Deal with duplicated instances due to mirroring in interpolation
+    during shape augmentation (scale, rotation etc.).
+
+    """
+    current_max_id = np.amax(ann)
+    inst_list = list(np.unique(ann))
+    if 0 in inst_list:
+        inst_list.remove(0)  # 0 is background
+    for inst_id in inst_list:
+        inst_map = np.array(ann == inst_id, np.uint8)
+        remapped_ids = measurements.label(inst_map)[0]
+        remapped_ids[remapped_ids > 1] += current_max_id
+        ann[remapped_ids > 1] = remapped_ids[remapped_ids > 1]
+        current_max_id = np.amax(ann)
+    return ann
+
+####
+def get_bounding_box(img):
+    """Get bounding box coordinate information."""
+    rows = np.any(img, axis=1)
+    cols = np.any(img, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    # due to python indexing, need to add 1 to max
+    # else accessing will be 1px in the box, not out
+    rmax += 1
+    cmax += 1
+    return [rmin, rmax, cmin, cmax]
+
+
+####
+def cropping_center(x, crop_shape, batch=False):
+    """Crop an input image at the centre.
+
+    Args:
+        x: input array
+        crop_shape: dimensions of cropped array
+    
+    Returns:
+        x: cropped array
+    
+    """
+    orig_shape = x.shape
+    if not batch:
+        h0 = int((orig_shape[0] - crop_shape[0]) * 0.5)
+        w0 = int((orig_shape[1] - crop_shape[1]) * 0.5)
+        x = x[h0 : h0 + crop_shape[0], w0 : w0 + crop_shape[1]]
+    else:
+        h0 = int((orig_shape[1] - crop_shape[0]) * 0.5)
+        w0 = int((orig_shape[2] - crop_shape[1]) * 0.5)
+        x = x[:, h0 : h0 + crop_shape[0], w0 : w0 + crop_shape[1]]
+    return x
+
+def gen_instance_hv_map(ann, crop_shape):
+    """Input annotation must be of original shape.
+    
+    The map is calculated only for instances within the crop portion
+    but based on the original shape in original image.
+
+    Perform following operation:
+    Obtain the horizontal and vertical distance maps for each
+    nuclear instance.
+
+    """
+    orig_ann = ann.copy()  # instance ID map
+    fixed_ann = fix_mirror_padding(orig_ann)
+    # re-cropping with fixed instance id map
+    crop_ann = cropping_center(fixed_ann, crop_shape)
+    # TODO: deal with 1 label warning
+    crop_ann = morph.remove_small_objects(crop_ann, min_size=30)
+
+    x_map = np.zeros(orig_ann.shape[:2], dtype=np.float32)
+    y_map = np.zeros(orig_ann.shape[:2], dtype=np.float32)
+
+    inst_list = list(np.unique(crop_ann))
+    if 0 in inst_list:
+        inst_list.remove(0)  # 0 is background
+    for inst_id in inst_list:
+        inst_map = np.array(fixed_ann == inst_id, np.uint8)
+        inst_box = get_bounding_box(inst_map) # rmin, rmax, cmin, cmax
+
+        # expand the box by 2px
+        # Because we first pad the ann at line 207, the bboxes
+        # will remain valid after expansion
+        inst_box[0] -= 2
+        inst_box[2] -= 2
+        inst_box[1] += 2
+        inst_box[3] += 2
+        
+        # fix inst_box
+        inst_box[0] = max(inst_box[0], 0)
+        inst_box[2] = max(inst_box[2], 0)
+        # inst_box[1] = min(inst_box[1], fixed_ann.shape[0]) 
+        # inst_box[3] = min(inst_box[3], fixed_ann.shape[1])
+
+        inst_map = inst_map[inst_box[0] : inst_box[1], inst_box[2] : inst_box[3]]
+
+        if inst_map.shape[0] < 2 or inst_map.shape[1] < 2:
+            print(f'inst_map.shape < 2: {inst_map.shape}, {inst_box}, {get_bounding_box(np.array(fixed_ann == inst_id, np.uint8))}')
+            continue
+
+        # instance center of mass, rounded to nearest pixel
+        inst_com = list(measurements.center_of_mass(inst_map))
+        if np.isnan(measurements.center_of_mass(inst_map)).any():
+            print(inst_id, fixed_ann.shape, np.array(fixed_ann == inst_id, np.uint8).shape)
+            print(get_bounding_box(np.array(fixed_ann == inst_id, np.uint8)))
+            print(inst_map)
+            print(inst_list)
+            print(inst_box)
+            print(np.count_nonzero(np.array(fixed_ann == inst_id, np.uint8)))
+
+        inst_com[0] = int(inst_com[0] + 0.5)
+        inst_com[1] = int(inst_com[1] + 0.5)
+
+        inst_x_range = np.arange(1, inst_map.shape[1] + 1)
+        inst_y_range = np.arange(1, inst_map.shape[0] + 1)
+        # shifting center of pixels grid to instance center of mass
+        inst_x_range -= inst_com[1]
+        inst_y_range -= inst_com[0]
+
+        inst_x, inst_y = np.meshgrid(inst_x_range, inst_y_range)
+
+        # remove coord outside of instance
+        inst_x[inst_map == 0] = 0
+        inst_y[inst_map == 0] = 0
+        inst_x = inst_x.astype("float32")
+        inst_y = inst_y.astype("float32")
+
+        # normalize min into -1 scale
+        if np.min(inst_x) < 0:
+            inst_x[inst_x < 0] /= -np.amin(inst_x[inst_x < 0])
+        if np.min(inst_y) < 0:
+            inst_y[inst_y < 0] /= -np.amin(inst_y[inst_y < 0])
+        # normalize max into +1 scale
+        if np.max(inst_x) > 0:
+            inst_x[inst_x > 0] /= np.amax(inst_x[inst_x > 0])
+        if np.max(inst_y) > 0:
+            inst_y[inst_y > 0] /= np.amax(inst_y[inst_y > 0])
+
+        ####
+        x_map_box = x_map[inst_box[0] : inst_box[1], inst_box[2] : inst_box[3]]
+        x_map_box[inst_map > 0] = inst_x[inst_map > 0]
+
+        y_map_box = y_map[inst_box[0] : inst_box[1], inst_box[2] : inst_box[3]]
+        y_map_box[inst_map > 0] = inst_y[inst_map > 0]
+
+    hv_map = np.dstack([x_map, y_map])
+    return hv_map
+
+def remove_small_objects(pred, min_size=64, connectivity=1):
+    """Remove connected components smaller than the specified size.
+
+    This function is taken from skimage.morphology.remove_small_objects, but the warning
+    is removed when a single label is provided.
+
+    Args:
+        pred: input labelled array
+        min_size: minimum size of instance in output array
+        connectivity: The connectivity defining the neighborhood of a pixel.
+
+    Returns:
+        out: output array with instances removed under min_size
+
+    """
+    out = pred
+
+    if min_size == 0:  # shortcut for efficiency
+        return out
+
+    if out.dtype == bool:
+        selem = ndimage.generate_binary_structure(pred.ndim, connectivity)
+        ccs = np.zeros_like(pred, dtype=np.int32)
+        ndimage.label(pred, selem, output=ccs)
+    else:
+        ccs = out
+
+    try:
+        component_sizes = np.bincount(ccs.ravel())
+    except ValueError:
+        raise ValueError(
+            "Negative value labels are not supported. Try "
+            "relabeling the input with `scipy.ndimage.label` or "
+            "`skimage.morphology.label`."
+        )
+
+    too_small = component_sizes < min_size
+    too_small_mask = too_small[ccs]
+    out[too_small_mask] = 0
+
+    return out
+
+####
+def gen_targets(ann, crop_shape, **kwargs):
+    """Generate the targets for the network."""
+    hv_map = gen_instance_hv_map(ann, crop_shape)
+    np_map = ann.copy()
+    np_map[np_map > 0] = 1
+
+    hv_map = cropping_center(hv_map, crop_shape)
+    np_map = cropping_center(np_map, crop_shape)
+
+    target_dict = {
+        "hv_map": hv_map,
+        "np_map": np_map,
+    }
+
+    return target_dict
+def __proc_np_hv(pred, np_thres=0.5, ksize=21, overall_thres=0.4, obj_size_thres=10):
+    """Process Nuclei Prediction with XY Coordinate Map.
+
+    Args:
+        pred: prediction output, assuming
+              channel 0 contain probability map of nuclei
+              channel 1 containing the regressed X-map
+              channel 2 containing the regressed Y-map
+
+    """
+    pred = np.array(pred, dtype=np.float32)
+
+    blb_raw = pred[..., 0]
+    h_dir_raw = pred[..., 1]
+    v_dir_raw = pred[..., 2]
+
+    # processing
+    blb = np.array(blb_raw >= np_thres, dtype=np.int32)
+
+    blb = measurements.label(blb)[0]
+    blb = remove_small_objects(blb, min_size=10)
+    blb[blb > 0] = 1  # background is 0 already
+
+    h_dir = cv2.normalize(
+        h_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+    v_dir = cv2.normalize(
+        v_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+
+    sobelh = cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=ksize)
+    sobelv = cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=ksize)
+
+    sobelh = 1 - (
+        cv2.normalize(
+            sobelh, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+    sobelv = 1 - (
+        cv2.normalize(
+            sobelv, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+
+    overall = np.maximum(sobelh, sobelv)
+    overall = overall - (1 - blb)
+    overall[overall < 0] = 0
+
+    dist = (1.0 - overall) * blb
+    ## nuclei values form mountains so inverse to get basins
+    dist = -cv2.GaussianBlur(dist, (3, 3), 0)
+
+    overall = np.array(overall >= overall_thres, dtype=np.int32)
+
+    marker = blb - overall
+    marker[marker < 0] = 0
+    marker = binary_fill_holes(marker).astype("uint8")
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
+    marker = measurements.label(marker)[0]
+    marker = remove_small_objects(marker, min_size=obj_size_thres)
+
+    proced_pred = watershed(dist, markers=marker, mask=blb)
+
+    return proced_pred
+
+####
+def colorize(ch, vmin, vmax):
+    """Will clamp value value outside the provided range to vmax and vmin."""
+    cmap = plt.get_cmap("jet")
+    ch = np.squeeze(ch.astype("float32"))
+    vmin = vmin if vmin is not None else ch.min()
+    vmax = vmax if vmax is not None else ch.max()
+    ch[ch > vmax] = vmax  # clamp value
+    ch[ch < vmin] = vmin
+    ch = (ch - vmin) / (vmax - vmin + 1.0e-16)
+    # take RGB from RGBA heat map
+    ch_cmap = (cmap(ch)[..., :3] * 255).astype("uint8")
+    return ch_cmap
+
+
+####
+def random_colors(N, bright=True):
+    """Generate random colors.
+
+    To get visually distinct colors, generate them in HSV space then
+    convert to RGB.
+    """
+    brightness = 1.0 if bright else 0.7
+    hsv = [(i / N, 1, brightness) for i in range(N)]
+    colors = list(map(lambda c: colorsys.hsv_to_rgb(*c), hsv))
+    random.shuffle(colors)
+    return colors
+
+
+####
+def visualize_instances_map(
+    input_image, inst_map, type_map=None, type_colour=None, line_thickness=2
+):
+    """Overlays segmentation results on image as contours.
+
+    Args:
+        input_image: input image
+        inst_map: instance mask with unique value for every object
+        type_map: type mask with unique value for every class
+        type_colour: a dict of {type : colour} , `type` is from 0-N
+                     and `colour` is a tuple of (R, G, B)
+        line_thickness: line thickness of contours
+
+    Returns:
+        overlay: output image with segmentation overlay as contours
+    """
+    overlay = np.copy((input_image).astype(np.uint8))
+
+    inst_list = list(np.unique(inst_map))  # get list of instances
+    inst_list.remove(0)  # remove background
+
+    inst_rng_colors = random_colors(len(inst_list))
+    inst_rng_colors = np.array(inst_rng_colors) * 255
+    inst_rng_colors = inst_rng_colors.astype(np.uint8)
+
+    for inst_idx, inst_id in enumerate(inst_list):
+        inst_map_mask = np.array(inst_map == inst_id, np.uint8)  # get single object
+        y1, y2, x1, x2 = get_bounding_box(inst_map_mask)
+        y1 = y1 - 2 if y1 - 2 >= 0 else y1
+        x1 = x1 - 2 if x1 - 2 >= 0 else x1
+        x2 = x2 + 2 if x2 + 2 <= inst_map.shape[1] - 1 else x2
+        y2 = y2 + 2 if y2 + 2 <= inst_map.shape[0] - 1 else y2
+        inst_map_crop = inst_map_mask[y1:y2, x1:x2]
+        contours_crop = cv2.findContours(
+            inst_map_crop, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        # only has 1 instance per map, no need to check #contour detected by opencv
+        contours_crop = np.squeeze(
+            contours_crop[0][0].astype("int32")
+        )  # * opencv protocol format may break
+        contours_crop += np.asarray([[x1, y1]])  # index correction
+        if type_map is not None:
+            type_map_crop = type_map[y1:y2, x1:x2]
+            type_id = np.unique(type_map_crop).max()  # non-zero
+            inst_colour = type_colour[type_id]
+        else:
+            inst_colour = (inst_rng_colors[inst_idx]).tolist()
+        cv2.drawContours(overlay, [contours_crop], -1, inst_colour, line_thickness)
+    return overlay
 
 
 def sliding_window_inference_large(inputs,block_size,min_overlap,context,roi_size,sw_batch_size,predictor,device):
@@ -48,9 +420,11 @@ def sliding_window_inference_large(inputs,block_size,min_overlap,context,roi_siz
         dist = output_dist[0].cpu().numpy()
         dist = np.transpose(dist,(1,2,0))
         dist = np.maximum(1e-3, dist)
-        points, probi, disti = non_maximum_suppression(dist,prob,prob_thresh=0.5, nms_thresh=0.4)
+        if h*w < 1500*1500:
+            points, probi, disti = non_maximum_suppression(dist,prob,prob_thresh=0.55, nms_thresh=0.4,cut=True)
+        else:
+            points, probi, disti = non_maximum_suppression(dist,prob,prob_thresh=0.5, nms_thresh=0.4)
 
-        coord = dist_to_coord(disti,points)
             
         labels_out = polygons_to_label(disti, points, prob=probi,shape=prob.shape)
     else:
@@ -200,7 +574,7 @@ def sliding_window_inference(
         half = diff // 2
         pad_size.extend([half, diff - half])
     inputs = F.pad(inputs, pad=pad_size, mode=look_up_option(padding_mode, PytorchPadMode), value=cval)
-
+    #print('inputs',inputs.shape)
     scan_interval = _get_scan_interval(image_size, roi_size, num_spatial_dims, overlap)
 
     # Store all slices in list
@@ -240,7 +614,7 @@ def sliding_window_inference(
             [convert_data_type(inputs[win_slice], torch.Tensor)[0] for win_slice in unravel_slice]
         ).to(sw_device)
         seg_prob_out = predictor(window_data, *args, **kwargs)  # batched patch segmentation
-
+        #print('seg_prob_out',seg_prob_out[0].shape)
         # convert seg_prob_out to tuple seg_prob_tuple, this does not allocate new memory.
         seg_prob_tuple: Tuple[torch.Tensor, ...]
         if isinstance(seg_prob_out, torch.Tensor):
