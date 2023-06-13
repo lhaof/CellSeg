@@ -60,8 +60,8 @@ import shutil
 from skimage import io
 from skimage.color import gray2rgb
 
-from models.unetr2d import UNETR2D
-from models.swin_unetr import SwinUNETR
+#from models.unetr2d import UNETR2D
+#from models.swin_unetr import SwinUNETR
 from models.flexible_unet_convext import FlexibleUNet_hv
 
 from utils import cropping_center, gen_targets, xentropy_loss, dice_loss, mse_loss, msge_loss
