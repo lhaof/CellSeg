@@ -48,8 +48,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import shutil
 import tqdm
-from models.unetr2d import UNETR2D
-from models.swin_unetr import SwinUNETR
+#from models.unetr2d import UNETR2D
+#from models.swin_unetr import SwinUNETR
 from models.flexible_unet import FlexibleUNet 
 from models.flexible_unet_convext import FlexibleUNetConvext
 print("Successfully imported all requirements!")
@@ -244,14 +244,6 @@ def main():
             pretrained=True,
         ).to(device)
     
-    if args.model_name.lower() == "swinunetr":
-        model = SwinUNETR(
-            img_size=(args.input_size, args.input_size),
-            in_channels=3,
-            out_channels=n_rays+1,
-            feature_size=24,  # should be divisible by 12
-            spatial_dims=2,
-        ).to(device)
   
     #loss_masked_dice = monai.losses.DiceCELoss(softmax=True)
     loss_dice = monai.losses.DiceLoss(squared_pred=True,jaccard=True)
@@ -268,13 +260,7 @@ def main():
         {"params": model.encoder.parameters(), "lr": initial_lr * 0.1},
     ]
     optimizer = torch.optim.AdamW(params, initial_lr)
-    #if pre_trained == True:
-        #print('Load pretrained weights...')
-        #checkpoint = torch.load('/mntnfs/med_data5/louwei/nips_comp/swin_stardist/swinunetr_3class/40.pth', map_location=torch.device(device))
-        #model.load_state_dict(checkpoint['model_state_dict'])
-    # start a typical PyTorch training
-    #checkpoint = torch.load("/data2/liuchenyu/log/convnextsmall/efficientunet_3class/510.pth", map_location=torch.device(device))
-    #model.load_state_dict(checkpoint['model_state_dict'])
+
     print('distributed model')
     model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)  
     print('successful model')
