@@ -58,6 +58,11 @@ Finally, four segmentation models will be trained.
 The models can be downloaded from this link:
 https://drive.google.com/drive/folders/1MkEOpgmdkg5Yqw6Ng5PoOhtmo9xPPwIj?usp=sharing
 
+Docker environment:
+```shell
+docker push lewislou/sribd-cellseg:tagname
+```
+
 ## Inference
 The inference process includes classification and segmentation.
 ```shell
@@ -69,6 +74,9 @@ Calculate the F-score for evaluation:
 ```shell
 python compute_metric.py --gt_path path_to_labels --seg_path output_path
 ```
+## Finetue on a new dataset
+We provide a jupyter notebook to train our model on a new dataset - cellpose step by step.
+The notebook codes are in the folder fintune_on_newdataset/finetune.py
 
 ## Results
 The tuning set F1 score of our method is 0.8795. The Running time with tolerance of our method on all the 101 cases in the tuning set is 0 (within the time tolerance) in our local workstation. 
