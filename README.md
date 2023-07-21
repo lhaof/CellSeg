@@ -68,7 +68,7 @@ The inference process includes classification and segmentation.
 ```shell
 python predict.py -i input_path -o output_path --model_path './models' 
 ```
-
+Colab codes for model inference: https://colab.research.google.com/drive/1Dk6V6vm0IqaIevjAyjUTuR1nZfT6EvCh?usp=sharing
 ## Evaluation
 Calculate the F-score for evaluation:
 ```shell
