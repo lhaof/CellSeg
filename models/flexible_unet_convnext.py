@@ -322,6 +322,7 @@ class FlexibleUNet_star(nn.Module):
         decoder_out = self.decoder(enc_out)
 
         dist = self.dist_head(decoder_out)
+        print(dist.shape)
         prob = self.prob_head(decoder_out)
 
         return dist,prob
